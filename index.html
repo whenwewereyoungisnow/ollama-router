@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ollama Smart Router</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: system-ui, -apple-system, sans-serif;
+            background: #0f172a;
+            color: #e2e8f0;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* --- Header bar --- */
+        header {
+            padding: 12px 20px;
+            background: #1e293b;
+            border-bottom: 1px solid #334155;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-shrink: 0;
+        }
+        header h1 {
+            font-size: 16px;
+            font-weight: 600;
+            color: #f1f5f9;
+        }
+        .header-right {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        #loaded-models {
+            font-size: 12px;
+            color: #64748b;
+        }
+        #loaded-models .tag {
+            display: inline-block;
+            padding: 2px 6px;
+            margin-left: 4px;
+            background: #1e3a5f;
+            border-radius: 3px;
+            font-size: 11px;
+            color: #7dd3fc;
+        }
+        #clear-btn {
+            padding: 6px 12px;
+            font-size: 12px;
+            border: 1px solid #475569;
+            border-radius: 4px;
+            background: transparent;
+            color: #94a3b8;
+            cursor: pointer;
+        }
+        #clear-btn:hover { background: #334155; color: #e2e8f0; }
+
+        /* --- Error banner --- */
+        #error-banner {
+            padding: 10px 20px;
+            background: #7f1d1d;
+            color: #fca5a5;
+            font-size: 13px;
+            display: none;
+            flex-shrink: 0;
+        }
+
+        /* --- Chat area --- */
+        #chat {
+            flex: 1;
+            overflow-y: auto;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+        }
+
+        .msg { max-width: 85%; line-height: 1.5; }
+
+        .msg.user {
+            align-self: flex-end;
+            background: #1d4ed8;
+            color: #e0f2fe;
+            padding: 10px 14px;
+            border-radius: 12px 12px 2px 12px;
+            white-space: pre-wrap;
+        }
+
+        .msg.assistant {
+            align-self: flex-start;
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+            max-width: 90%;
+        }
+
+        .msg.assistant .badge {
+            font-size: 12px;
+            color: #7dd3fc;
+            padding: 3px 0;
+        }
+        .msg.assistant .badge .model { font-weight: 600; }
+        .msg.assistant .badge .reason { color: #64748b; }
+
+        .msg.assistant .content {
+            background: #1e293b;
+            padding: 12px 16px;
+            border-radius: 2px 12px 12px 12px;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+
+        /* Monospace for code blocks inside responses */
+        .msg.assistant .content code {
+            font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace;
+            background: #0f172a;
+            padding: 1px 4px;
+            border-radius: 3px;
+            font-size: 0.9em;
+        }
+        .msg.assistant .content pre {
+            background: #0f172a;
+            padding: 10px;
+            border-radius: 4px;
+            overflow-x: auto;
+            margin: 8px 0;
+        }
+        .msg.assistant .content pre code {
+            background: none;
+            padding: 0;
+        }
+
+        .msg.assistant .timing {
+            font-size: 11px;
+            color: #475569;
+            padding: 2px 0;
+        }
+
+        /* Status message (classifying, loading model) */
+        .msg.status {
+            align-self: flex-start;
+            font-size: 13px;
+            color: #64748b;
+            font-style: italic;
+            padding: 4px 0;
+        }
+
+        /* --- Input area --- */
+        #input-area {
+            padding: 12px 20px;
+            background: #1e293b;
+            border-top: 1px solid #334155;
+            display: flex;
+            gap: 8px;
+            flex-shrink: 0;
+        }
+        #input {
+            flex: 1;
+            padding: 10px 14px;
+            font-size: 14px;
+            font-family: inherit;
+            background: #0f172a;
+            color: #e2e8f0;
+            border: 1px solid #334155;
+            border-radius: 8px;
+            resize: none;
+            min-height: 42px;
+            max-height: 120px;
+            line-height: 1.4;
+        }
+        #input:focus { outline: none; border-color: #3b82f6; }
+        #input::placeholder { color: #475569; }
+
+        #send-btn {
+            padding: 10px 20px;
+            font-size: 14px;
+            border: none;
+            border-radius: 8px;
+            background: #2563eb;
+            color: white;
+            cursor: pointer;
+            align-self: flex-end;
+        }
+        #send-btn:hover { background: #1d4ed8; }
+        #send-btn:disabled { background: #1e3a5f; color: #475569; cursor: not-allowed; }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>Ollama Smart Router</h1>
+        <div class="header-right">
+            <span id="loaded-models">Models: ...</span>
+            <button id="clear-btn" onclick="clearConversation()">Clear</button>
+        </div>
+    </header>
+
+    <div id="error-banner"></div>
+
+    <div id="chat"></div>
+
+    <div id="input-area">
+        <textarea id="input" rows="1" placeholder="Ask a question... (Shift+Enter for newline)"></textarea>
+        <button id="send-btn" onclick="send()">Send</button>
+    </div>
+
+    <script>
+        const chatDiv = document.getElementById("chat");
+        const inputEl = document.getElementById("input");
+        const sendBtn = document.getElementById("send-btn");
+        const errorBanner = document.getElementById("error-banner");
+        const loadedModelsEl = document.getElementById("loaded-models");
+
+        // Conversation history — sent to the backend with each request so
+        // Ollama sees the full context. Resets on page reload (no database).
+        let history = [];
+        let streaming = false;
+
+        // --- Input handling ---
+        // Enter sends, Shift+Enter inserts a newline.
+        inputEl.addEventListener("keydown", (e) => {
+            if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                send();
+            }
+        });
+
+        // Auto-resize textarea as user types
+        inputEl.addEventListener("input", () => {
+            inputEl.style.height = "auto";
+            inputEl.style.height = Math.min(inputEl.scrollHeight, 120) + "px";
+        });
+
+        function scrollToBottom() {
+            chatDiv.scrollTop = chatDiv.scrollHeight;
+        }
+
+        function showError(msg) {
+            errorBanner.textContent = msg;
+            errorBanner.style.display = "block";
+        }
+
+        function hideError() {
+            errorBanner.style.display = "none";
+        }
+
+        // --- Send a message ---
+        async function send() {
+            const text = inputEl.value.trim();
+            if (!text || streaming) return;
+
+            hideError();
+            streaming = true;
+            sendBtn.disabled = true;
+
+            // Add user message to history and UI
+            history.push({role: "user", content: text});
+            const userDiv = document.createElement("div");
+            userDiv.className = "msg user";
+            userDiv.textContent = text;
+            chatDiv.appendChild(userDiv);
+
+            inputEl.value = "";
+            inputEl.style.height = "auto";
+            scrollToBottom();
+
+            // Status indicator while classifying
+            const statusDiv = document.createElement("div");
+            statusDiv.className = "msg status";
+            statusDiv.textContent = "Classifying question...";
+            chatDiv.appendChild(statusDiv);
+            scrollToBottom();
+
+            // Create assistant message container
+            const assistantDiv = document.createElement("div");
+            assistantDiv.className = "msg assistant";
+
+            const badgeDiv = document.createElement("div");
+            badgeDiv.className = "badge";
+
+            const contentDiv = document.createElement("div");
+            contentDiv.className = "content";
+
+            const timingDiv = document.createElement("div");
+            timingDiv.className = "timing";
+
+            assistantDiv.appendChild(badgeDiv);
+            assistantDiv.appendChild(contentDiv);
+            assistantDiv.appendChild(timingDiv);
+
+            let fullResponse = "";
+
+            try {
+                const res = await fetch("/chat", {
+                    method: "POST",
+                    headers: {"Content-Type": "application/json"},
+                    body: JSON.stringify({messages: history}),
+                });
+
+                if (!res.ok) {
+                    throw new Error("Server returned " + res.status);
+                }
+
+                const reader = res.body.getReader();
+                const decoder = new TextDecoder();
+                let buffer = "";
+
+                while (true) {
+                    const {done, value} = await reader.read();
+                    if (done) break;
+
+                    buffer += decoder.decode(value, {stream: true});
+
+                    // SSE events are separated by blank lines. The regex
+                    // handles both \r\n (sse-starlette) and \n line endings.
+                    const parts = buffer.split(/\r?\n\r?\n/);
+                    buffer = parts.pop();
+
+                    for (const part of parts) {
+                        let eventType = "message";
+                        let eventData = "";
+
+                        for (const line of part.split(/\r?\n/)) {
+                            if (line.startsWith("event: ")) {
+                                eventType = line.slice(7);
+                            } else if (line.startsWith("data: ")) {
+                                eventData = line.slice(6);
+                            }
+                        }
+
+                        if (eventType === "error") {
+                            const err = JSON.parse(eventData);
+                            showError(err.message);
+                            statusDiv.remove();
+                            streaming = false;
+                            sendBtn.disabled = false;
+                            // Remove the failed user message from history
+                            history.pop();
+                            return;
+                        }
+
+                        if (eventType === "classification") {
+                            const info = JSON.parse(eventData);
+                            badgeDiv.innerHTML =
+                                '<span class="model">' + info.model + '</span>' +
+                                ' <span class="reason">' + info.reason + '</span>';
+
+                            // Replace status with assistant container
+                            statusDiv.remove();
+                            chatDiv.appendChild(assistantDiv);
+
+                            if (!info.model_loaded) {
+                                const loadDiv = document.createElement("div");
+                                loadDiv.className = "msg status";
+                                loadDiv.id = "loading-status";
+                                loadDiv.textContent = "Loading " + info.model + " into memory...";
+                                chatDiv.insertBefore(loadDiv, assistantDiv);
+                            }
+                            scrollToBottom();
+                            continue;
+                        }
+
+                        if (eventType === "metrics") {
+                            const m = JSON.parse(eventData);
+                            timingDiv.textContent =
+                                "Classified in " + m.classify_seconds + "s" +
+                                " | First token: " + m.first_token_seconds + "s" +
+                                " | Total: " + m.total_seconds + "s" +
+                                " | " + m.tokens_per_second + " tok/s" +
+                                " (" + m.eval_count + " tokens)";
+                            continue;
+                        }
+
+                        if (eventData === "[DONE]") {
+                            // Remove loading status if present
+                            const ls = document.getElementById("loading-status");
+                            if (ls) ls.remove();
+
+                            // Save assistant response to history
+                            history.push({role: "assistant", content: fullResponse});
+                            refreshModels();
+                            streaming = false;
+                            sendBtn.disabled = false;
+                            inputEl.focus();
+                            return;
+                        }
+
+                        // Token data — append to response
+                        if (eventData) {
+                            // Remove loading status on first token
+                            const ls = document.getElementById("loading-status");
+                            if (ls) ls.remove();
+
+                            fullResponse += eventData;
+                            contentDiv.textContent = fullResponse;
+                            scrollToBottom();
+                        }
+                    }
+                }
+            } catch (err) {
+                statusDiv.remove();
+                showError("Connection error: " + err.message);
+                // Remove the failed message from history
+                history.pop();
+            }
+
+            streaming = false;
+            sendBtn.disabled = false;
+            inputEl.focus();
+        }
+
+        // --- Clear conversation ---
+        async function clearConversation() {
+            history = [];
+            chatDiv.innerHTML = "";
+            hideError();
+            try { await fetch("/clear", {method: "POST"}); } catch (e) {}
+            inputEl.focus();
+        }
+
+        // --- Loaded models indicator ---
+        async function refreshModels() {
+            try {
+                const res = await fetch("/models");
+                if (!res.ok) return;
+                const data = await res.json();
+
+                if (data.error) {
+                    loadedModelsEl.innerHTML = 'Models: <span style="color:#ef4444">offline</span>';
+                    return;
+                }
+
+                if (data.loaded.length === 0) {
+                    loadedModelsEl.innerHTML = 'Models: <span style="color:#64748b">none loaded</span>';
+                } else {
+                    loadedModelsEl.innerHTML = "In memory: " +
+                        data.loaded.map(n => '<span class="tag">' + n + '</span>').join("");
+                }
+            } catch (e) {
+                loadedModelsEl.innerHTML = 'Models: <span style="color:#ef4444">offline</span>';
+            }
+        }
+
+        refreshModels();
+        inputEl.focus();
+    </script>
+</body>
+</html>

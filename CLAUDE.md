@@ -14,24 +14,25 @@ but the "why" behind architectural choices.
 ## Architecture (locked in — don't change these)
 
 - **Backend:** FastAPI + Uvicorn, single file (main.py) unless it exceeds ~500 lines
-- **Frontend:** Plain HTML + vanilla JavaScript, inline in main.py (no React, no build step, no separate files)
+- **Frontend:** Plain HTML + vanilla JavaScript in index.html (split from main.py at ~600 lines)
 - **Streaming:** Server-Sent Events (SSE) via sse-starlette (not WebSockets)
 - **HTTP client:** httpx (for calling Ollama)
 - **Dependency management:** uv (never pip)
 
 ## Models
 
-- **Classifier:** `qwen3.5:35b-a3b` — MoE, fast, also handles "general" route
+- **Classifier:** `llama3.2:3b` — tiny (~2GB VRAM), stays loaded alongside response models
+- **General route:** `qwen3.5:35b-a3b` — MoE, fast, general knowledge
 - **Code route:** `qwen3.5:27b` — dense, strong at programming and analysis
 - **Reasoning route:** `deepseek-r1:32b` — chain-of-thought, math, logic
 - **Ollama API:** `http://localhost:11434`
 
 ## Routing logic
 
-The classifier sends the question to qwen3.5:35b-a3b with a system prompt
+The classifier sends the question to llama3.2:3b with a system prompt
 that returns JSON: `{"route": "general|code|reasoning", "reason": "..."}`.
-Classification uses stream=false and temperature=0. The actual response
-uses stream=true.
+Classification uses stream=false, temperature=0, think=false, num_ctx=1024.
+The actual response uses stream=true with num_ctx=4096.
 
 ## Rules
 
