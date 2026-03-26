@@ -18,7 +18,36 @@ from sse_starlette.sse import EventSourceResponse
 app = FastAPI()
 
 OLLAMA_BASE_URL = "http://localhost:11434"
-CHAT_MODEL = "qwen3.5:35b-a3b"
+
+# --- Model routing map ---
+#
+# The classifier picks a route ("general", "code", or "reasoning"), and we
+# map that to a specific Ollama model. The classifier itself always runs on
+# the fast MoE model (qwen3.5:35b-a3b). When the route is "general", the
+# response model happens to be the same as the classifier — that's fine,
+# they're separate calls with different prompts (classification vs. answering).
+CLASSIFIER_MODEL = "qwen3.5:35b-a3b"
+
+ROUTE_TO_MODEL: dict[str, str] = {
+    "general": "qwen3.5:35b-a3b",
+    "code": "qwen3.5:27b",
+    "reasoning": "deepseek-r1:32b",
+}
+
+CLASSIFIER_SYSTEM_PROMPT = """You are a question classifier. Given a user's question, decide which \
+model should answer it. Respond with ONLY a JSON object, nothing else.
+
+Your options:
+- "general" — everyday questions, summaries, creative writing, quick facts
+- "code" — programming, debugging, technical explanations, system design
+- "reasoning" — math, logic puzzles, step-by-step analysis, comparisons
+
+Format: {"route": "general|code|reasoning", "reason": "one sentence why"}
+
+Examples:
+- "What's the capital of France?" → {"route": "general", "reason": "Simple factual question"}
+- "Write a Python function to sort a list" → {"route": "code", "reason": "Programming task"}
+- "If I have 3 boxes with 2 balls each..." → {"route": "reasoning", "reason": "Logic problem requiring step-by-step thinking"}"""
 
 
 class ChatRequest(BaseModel):
@@ -62,21 +91,89 @@ class ChatRequest(BaseModel):
 # We read each chunk, extract the token text, and forward it as an SSE event.
 
 
-async def stream_chat(message: str) -> AsyncGenerator[dict[str, str], None]:
-    """Stream tokens from Ollama and yield them as SSE event dicts.
+# --- Why classification uses stream=false and temperature=0 ---
+#
+# stream=false: Classification is a quick, small response (just a JSON object).
+# We need the full response before we can pick a model and start streaming,
+# so there's no benefit to streaming it — we'd just wait for all chunks anyway.
+#
+# temperature=0: We want deterministic routing. The same question should always
+# go to the same model. Temperature=0 removes randomness from sampling, so the
+# classifier picks the most likely route every time instead of occasionally
+# rolling a different answer.
 
-    Each yielded dict has a "data" key — sse-starlette turns these into
-    properly formatted SSE lines (data: ...\n\n) automatically.
+
+async def classify_question(question: str) -> tuple[str, str, str]:
+    """Classify a question and return (route, reason, model_name).
+
+    Sends the question to the classifier model with a system prompt that
+    asks for a JSON response. If parsing fails, defaults to "general".
     """
     async with httpx.AsyncClient() as client:
-        # stream=True tells httpx to give us the response incrementally
-        # (not to be confused with the stream=True in the JSON body, which
-        # tells *Ollama* to stream its output). We need both.
+        response = await client.post(
+            f"{OLLAMA_BASE_URL}/api/chat",
+            json={
+                "model": CLASSIFIER_MODEL,
+                "messages": [
+                    {"role": "system", "content": CLASSIFIER_SYSTEM_PROMPT},
+                    {"role": "user", "content": question},
+                ],
+                "stream": False,
+                "options": {"temperature": 0},
+            },
+            timeout=60.0,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+    content = data["message"]["content"]
+
+    # The classifier should return pure JSON, but sometimes models wrap it
+    # in markdown code fences or add extra text. Try to extract JSON.
+    try:
+        result = json.loads(content)
+        route = result["route"]
+        reason = result["reason"]
+    except (json.JSONDecodeError, KeyError):
+        # If the model returned something unparseable, fall back to general.
+        # This keeps the app working even if the classifier misbehaves.
+        route = "general"
+        reason = "Classification unclear, using default"
+
+    # Validate that the route is one we know about
+    if route not in ROUTE_TO_MODEL:
+        route = "general"
+        reason = "Classification unclear, using default"
+
+    model = ROUTE_TO_MODEL[route]
+    return route, reason, model
+
+
+async def stream_chat(message: str) -> AsyncGenerator[dict[str, str], None]:
+    """Classify the question, then stream the response from the chosen model.
+
+    The first SSE event carries the classification result as JSON (with an
+    "event" field set to "classification" so the frontend can distinguish it
+    from token events). All subsequent events are token chunks.
+    """
+    # Step 1: Classify (non-streaming, fast)
+    route, reason, model = await classify_question(message)
+
+    # Step 2: Send classification as the first SSE event.
+    # We use a named event type ("classification") so the frontend can tell
+    # this apart from token data without inspecting the payload.
+    yield {
+        "event": "classification",
+        "data": json.dumps({"route": route, "reason": reason, "model": model}),
+    }
+
+    # Step 3: Stream the actual response from the chosen model
+    async with httpx.AsyncClient() as client:
         async with client.stream(
             "POST",
             f"{OLLAMA_BASE_URL}/api/chat",
             json={
-                "model": CHAT_MODEL,
+                "model": model,
                 "messages": [{"role": "user", "content": message}],
                 "stream": True,
             },
@@ -84,8 +181,6 @@ async def stream_chat(message: str) -> AsyncGenerator[dict[str, str], None]:
         ) as response:
             response.raise_for_status()
 
-            # Ollama sends newline-delimited JSON (one JSON object per line).
-            # httpx's aiter_lines() gives us each line as it arrives.
             async for line in response.aiter_lines():
                 if not line:
                     continue
@@ -149,6 +244,23 @@ async def home() -> HTMLResponse:
                 color: #666;
                 font-style: italic;
             }
+            #routing-badge {
+                margin-top: 12px;
+                padding: 8px 12px;
+                background: #e0f2fe;
+                border-left: 3px solid #2563eb;
+                border-radius: 4px;
+                font-size: 14px;
+                color: #1e40af;
+                display: none;
+            }
+            #routing-badge .model-name {
+                font-weight: 600;
+            }
+            #routing-badge .route-reason {
+                color: #64748b;
+                margin-left: 4px;
+            }
             #response {
                 margin-top: 16px;
                 padding: 16px;
@@ -167,12 +279,14 @@ async def home() -> HTMLResponse:
             <button id="send-btn" onclick="sendQuestion()">Send</button>
         </div>
         <div id="status"></div>
+        <div id="routing-badge"></div>
         <div id="response"></div>
 
         <script>
             const questionInput = document.getElementById("question");
             const sendBtn = document.getElementById("send-btn");
             const statusDiv = document.getElementById("status");
+            const routingBadge = document.getElementById("routing-badge");
             const responseDiv = document.getElementById("response");
 
             // Send on Enter key press
@@ -187,16 +301,24 @@ async def home() -> HTMLResponse:
             // question in the request body. Instead, we use fetch() and manually
             // read the response body as a stream of text.
             //
-            // The response is an SSE stream — lines like "data: Hello\\n\\n".
-            // We split on double-newlines to get individual events, strip the
-            // "data: " prefix, and append each token to the page.
+            // The SSE stream now has two event types:
+            //   1. "classification" event — JSON with route, reason, model
+            //   2. default "message" events — token text chunks + [DONE]
+            //
+            // Named events look like this on the wire:
+            //   event: classification
+            //   data: {"route":"code","reason":"...","model":"qwen3.5:27b"}
+            //
+            // Default events (no "event:" line) just have:
+            //   data: Hello
 
             async function sendQuestion() {
                 const message = questionInput.value.trim();
                 if (!message) return;
 
                 sendBtn.disabled = true;
-                statusDiv.textContent = "Thinking...";
+                statusDiv.textContent = "Classifying question...";
+                routingBadge.style.display = "none";
                 responseDiv.textContent = "";
                 responseDiv.style.display = "none";
 
@@ -212,41 +334,58 @@ async def home() -> HTMLResponse:
                     const reader = res.body.getReader();
                     const decoder = new TextDecoder();
                     let buffer = "";
+                    let currentModel = "";
 
                     while (true) {
                         const {done, value} = await reader.read();
                         if (done) break;
 
-                        // Decode the binary chunk into text and add to buffer.
-                        // SSE events are separated by blank lines. We use a
-                        // regex to handle both \\r\\n and \\n line endings
-                        // (sse-starlette sends \\r\\n).
                         buffer += decoder.decode(value, {stream: true});
 
-                        // Split on blank lines (two consecutive line breaks)
+                        // Split on blank lines — handles both \\r\\n and \\n
                         const parts = buffer.split(/\\r?\\n\\r?\\n/);
-                        // Keep the last part — it might be an incomplete event
                         buffer = parts.pop();
 
                         for (const part of parts) {
+                            // Parse each SSE event: look for "event:" and "data:" lines
+                            let eventType = "message";
+                            let eventData = "";
+
                             for (const line of part.split(/\\r?\\n/)) {
-                                if (!line.startsWith("data: ")) continue;
-                                const token = line.slice(6);  // strip "data: "
-
-                                if (token === "[DONE]") {
-                                    statusDiv.textContent = "Model: __MODEL__";
-                                    sendBtn.disabled = false;
-                                    questionInput.focus();
-                                    return;
+                                if (line.startsWith("event: ")) {
+                                    eventType = line.slice(7);
+                                } else if (line.startsWith("data: ")) {
+                                    eventData = line.slice(6);
                                 }
+                            }
 
-                                // First token: clear "Thinking..." and show response area
+                            // Handle classification event — show the routing badge
+                            if (eventType === "classification") {
+                                const info = JSON.parse(eventData);
+                                currentModel = info.model;
+                                routingBadge.innerHTML =
+                                    'Routed to: <span class="model-name">' + info.model + '</span>' +
+                                    '<span class="route-reason"> (' + info.reason + ')</span>';
+                                routingBadge.style.display = "block";
+                                statusDiv.textContent = "Streaming response...";
+                                continue;
+                            }
+
+                            // Handle token events
+                            if (eventData === "[DONE]") {
+                                statusDiv.textContent = "";
+                                sendBtn.disabled = false;
+                                questionInput.focus();
+                                return;
+                            }
+
+                            if (eventData) {
+                                // First token: show the response area
                                 if (responseDiv.style.display === "none") {
                                     statusDiv.textContent = "";
                                     responseDiv.style.display = "block";
                                 }
-
-                                responseDiv.textContent += token;
+                                responseDiv.textContent += eventData;
                             }
                         }
                     }
@@ -263,7 +402,7 @@ async def home() -> HTMLResponse:
         </script>
     </body>
     </html>
-    """.replace("__MODEL__", CHAT_MODEL)
+    """
     return HTMLResponse(content=html)
 
 
