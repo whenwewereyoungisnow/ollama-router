@@ -7,6 +7,7 @@
 # handles the *networking*.
 
 import json
+import time
 from collections.abc import AsyncGenerator
 
 import httpx
@@ -89,9 +90,22 @@ class ChatRequest(BaseModel):
 # Each chunk has "done": false and carries a small piece of text in
 # message.content. The final chunk has "done": true and empty content.
 # We read each chunk, extract the token text, and forward it as an SSE event.
+#
+# --- Ollama's timing metadata (in the final chunk) ---
+#
+# When done=true, Ollama includes performance stats:
+#
+#   eval_count:    number of tokens the model generated (output tokens)
+#   eval_duration: time spent generating those tokens, in *nanoseconds*
+#
+# Tokens-per-second = eval_count / (eval_duration / 1e9)
+#
+# This measures pure generation speed — excludes prompt processing,
+# model loading, and network overhead. It's the best measure of how
+# fast the model itself is running on your hardware.
 
 
-# --- Why classification uses stream=false and temperature=0 ---
+# --- Why classification uses stream=false, temperature=0, and think=false ---
 #
 # stream=false: Classification is a quick, small response (just a JSON object).
 # We need the full response before we can pick a model and start streaming,
@@ -101,14 +115,22 @@ class ChatRequest(BaseModel):
 # go to the same model. Temperature=0 removes randomness from sampling, so the
 # classifier picks the most likely route every time instead of occasionally
 # rolling a different answer.
+#
+# think=false: Some models (like qwen3.5) have a "thinking" mode where they
+# generate hundreds of internal reasoning tokens before the actual answer.
+# That's great for complex questions but terrible for classification — it
+# turns a sub-second call into 15+ seconds of unnecessary chain-of-thought.
+# Disabling it forces the model to respond directly with the JSON we need.
 
 
-async def classify_question(question: str) -> tuple[str, str, str]:
-    """Classify a question and return (route, reason, model_name).
+async def classify_question(question: str) -> tuple[str, str, str, float]:
+    """Classify a question and return (route, reason, model_name, duration_seconds).
 
     Sends the question to the classifier model with a system prompt that
     asks for a JSON response. If parsing fails, defaults to "general".
     """
+    start = time.monotonic()
+
     async with httpx.AsyncClient() as client:
         response = await client.post(
             f"{OLLAMA_BASE_URL}/api/chat",
@@ -119,6 +141,7 @@ async def classify_question(question: str) -> tuple[str, str, str]:
                     {"role": "user", "content": question},
                 ],
                 "stream": False,
+                "think": False,
                 "options": {"temperature": 0},
             },
             timeout=60.0,
@@ -126,6 +149,7 @@ async def classify_question(question: str) -> tuple[str, str, str]:
         response.raise_for_status()
         data = response.json()
 
+    classify_time = time.monotonic() - start
     content = data["message"]["content"]
 
     # The classifier should return pure JSON, but sometimes models wrap it
@@ -146,28 +170,69 @@ async def classify_question(question: str) -> tuple[str, str, str]:
         reason = "Classification unclear, using default"
 
     model = ROUTE_TO_MODEL[route]
-    return route, reason, model
+    return route, reason, model, classify_time
 
 
 async def stream_chat(message: str) -> AsyncGenerator[dict[str, str], None]:
     """Classify the question, then stream the response from the chosen model.
 
-    The first SSE event carries the classification result as JSON (with an
-    "event" field set to "classification" so the frontend can distinguish it
-    from token events). All subsequent events are token chunks.
+    SSE event types sent to the frontend:
+      1. "classification" — route info + classify time (immediately)
+      2. default (data-only) — token text chunks
+      3. "metrics" — timing summary (after final token)
+      4. data: [DONE] — signals end of stream
     """
     # Step 1: Classify (non-streaming, fast)
-    route, reason, model = await classify_question(message)
+    route, reason, model, classify_time = await classify_question(message)
 
-    # Step 2: Send classification as the first SSE event.
-    # We use a named event type ("classification") so the frontend can tell
-    # this apart from token data without inspecting the payload.
+    # Step 2: Check if the target model is already loaded in memory.
+    # If not, Ollama will need to swap models, which can take minutes for
+    # large models. We tell the frontend so it can show a loading message.
+    model_loaded = True
+    try:
+        async with httpx.AsyncClient() as client:
+            ps_resp = await client.get(f"{OLLAMA_BASE_URL}/api/ps", timeout=5.0)
+            ps_resp.raise_for_status()
+            loaded = [m["name"] for m in ps_resp.json().get("models", [])]
+            model_loaded = model in loaded
+    except httpx.HTTPError:
+        pass  # If we can't check, assume it's loaded and don't show the warning
+
+    # Step 3: Send classification as the first SSE event
     yield {
         "event": "classification",
-        "data": json.dumps({"route": route, "reason": reason, "model": model}),
+        "data": json.dumps(
+            {
+                "route": route,
+                "reason": reason,
+                "model": model,
+                "classify_seconds": round(classify_time, 2),
+                "model_loaded": model_loaded,
+            }
+        ),
     }
 
-    # Step 3: Stream the actual response from the chosen model
+    # Step 4: Stream the actual response from the chosen model
+    stream_start = time.monotonic()
+    first_token_time: float | None = None
+
+    # --- httpx timeout strategy for model swaps ---
+    #
+    # When Ollama switches models, it must unload one from VRAM and load
+    # another from disk. For 20-30GB models this can take minutes — well
+    # beyond a simple 120s total timeout.
+    #
+    # httpx.Timeout lets us set separate limits:
+    #   connect: max time to establish the TCP connection (10s is plenty)
+    #   read:    max time to wait *between* chunks (120s handles slow model loads,
+    #            then resets after each streaming chunk arrives)
+    #   write:   max time to send the request body (10s is plenty)
+    #   pool:    max time waiting for a connection from the pool (10s)
+    #
+    # This way a model swap that takes 3 minutes won't timeout, but a truly
+    # dead connection (no data for 120s) still gets caught.
+    stream_timeout = httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0)
+
     async with httpx.AsyncClient() as client:
         async with client.stream(
             "POST",
@@ -177,7 +242,7 @@ async def stream_chat(message: str) -> AsyncGenerator[dict[str, str], None]:
                 "messages": [{"role": "user", "content": message}],
                 "stream": True,
             },
-            timeout=120.0,
+            timeout=stream_timeout,
         ) as response:
             response.raise_for_status()
 
@@ -189,9 +254,37 @@ async def stream_chat(message: str) -> AsyncGenerator[dict[str, str], None]:
                 token = chunk["message"]["content"]
 
                 if token:
+                    if first_token_time is None:
+                        first_token_time = time.monotonic() - stream_start
                     yield {"data": token}
 
                 if chunk.get("done"):
+                    total_time = time.monotonic() - stream_start
+
+                    # Extract Ollama's generation stats from the final chunk.
+                    # eval_count = output tokens generated
+                    # eval_duration = generation time in nanoseconds
+                    eval_count = chunk.get("eval_count", 0)
+                    eval_duration_ns = chunk.get("eval_duration", 0)
+
+                    tokens_per_sec = 0.0
+                    if eval_duration_ns > 0:
+                        tokens_per_sec = eval_count / (eval_duration_ns / 1e9)
+
+                    # Step 4: Send timing metrics as a named event
+                    yield {
+                        "event": "metrics",
+                        "data": json.dumps(
+                            {
+                                "classify_seconds": round(classify_time, 2),
+                                "first_token_seconds": round(first_token_time or 0, 2),
+                                "total_seconds": round(total_time, 2),
+                                "tokens_per_second": round(tokens_per_sec, 1),
+                                "eval_count": eval_count,
+                            }
+                        ),
+                    }
+
                     yield {"data": "[DONE]"}
                     return
 
@@ -199,6 +292,34 @@ async def stream_chat(message: str) -> AsyncGenerator[dict[str, str], None]:
 @app.post("/chat")
 async def chat(request: ChatRequest) -> EventSourceResponse:
     return EventSourceResponse(stream_chat(request.message))
+
+
+@app.get("/models")
+async def models() -> dict:
+    """List available models and which ones are currently loaded in VRAM.
+
+    Calls two Ollama endpoints:
+      /api/tags — all models downloaded on disk
+      /api/ps   — models currently loaded in memory (ready for fast inference)
+    """
+    async with httpx.AsyncClient() as client:
+        tags_resp = await client.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=10.0)
+        tags_resp.raise_for_status()
+        all_models = [
+            {
+                "name": m["name"],
+                "size_gb": round(m["size"] / 1e9, 1),
+                "parameter_size": m["details"].get("parameter_size", ""),
+                "quantization": m["details"].get("quantization_level", ""),
+            }
+            for m in tags_resp.json().get("models", [])
+        ]
+
+        ps_resp = await client.get(f"{OLLAMA_BASE_URL}/api/ps", timeout=10.0)
+        ps_resp.raise_for_status()
+        loaded_models = [m["name"] for m in ps_resp.json().get("models", [])]
+
+    return {"available": all_models, "loaded": loaded_models}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -269,6 +390,37 @@ async def home() -> HTMLResponse:
                 white-space: pre-wrap;
                 display: none;
             }
+            #timing {
+                margin-top: 8px;
+                font-size: 13px;
+                color: #94a3b8;
+                display: none;
+            }
+            #loaded-models {
+                margin-top: 24px;
+                padding: 8px 12px;
+                background: #f8fafc;
+                border: 1px solid #e2e8f0;
+                border-radius: 6px;
+                font-size: 13px;
+                color: #64748b;
+            }
+            #loaded-models .label {
+                font-weight: 600;
+                color: #475569;
+            }
+            #loaded-models .model-tag {
+                display: inline-block;
+                padding: 2px 8px;
+                margin: 2px 4px;
+                background: #e0f2fe;
+                border-radius: 4px;
+                font-size: 12px;
+                color: #1e40af;
+            }
+            #loaded-models .none-loaded {
+                font-style: italic;
+            }
         </style>
     </head>
     <body>
@@ -281,6 +433,8 @@ async def home() -> HTMLResponse:
         <div id="status"></div>
         <div id="routing-badge"></div>
         <div id="response"></div>
+        <div id="timing"></div>
+        <div id="loaded-models"><span class="label">Models in memory:</span> loading...</div>
 
         <script>
             const questionInput = document.getElementById("question");
@@ -288,6 +442,8 @@ async def home() -> HTMLResponse:
             const statusDiv = document.getElementById("status");
             const routingBadge = document.getElementById("routing-badge");
             const responseDiv = document.getElementById("response");
+            const timingDiv = document.getElementById("timing");
+            const loadedModelsDiv = document.getElementById("loaded-models");
 
             // Send on Enter key press
             questionInput.addEventListener("keydown", (e) => {
@@ -301,16 +457,11 @@ async def home() -> HTMLResponse:
             // question in the request body. Instead, we use fetch() and manually
             // read the response body as a stream of text.
             //
-            // The SSE stream now has two event types:
-            //   1. "classification" event — JSON with route, reason, model
-            //   2. default "message" events — token text chunks + [DONE]
-            //
-            // Named events look like this on the wire:
-            //   event: classification
-            //   data: {"route":"code","reason":"...","model":"qwen3.5:27b"}
-            //
-            // Default events (no "event:" line) just have:
-            //   data: Hello
+            // The SSE stream now has these event types:
+            //   1. "classification" — JSON with route, reason, model, classify time
+            //   2. default events   — token text chunks
+            //   3. "metrics"        — timing summary (after last token)
+            //   4. data: [DONE]     — signals end of stream
 
             async function sendQuestion() {
                 const message = questionInput.value.trim();
@@ -321,6 +472,7 @@ async def home() -> HTMLResponse:
                 routingBadge.style.display = "none";
                 responseDiv.textContent = "";
                 responseDiv.style.display = "none";
+                timingDiv.style.display = "none";
 
                 try {
                     const res = await fetch("/chat", {
@@ -334,7 +486,6 @@ async def home() -> HTMLResponse:
                     const reader = res.body.getReader();
                     const decoder = new TextDecoder();
                     let buffer = "";
-                    let currentModel = "";
 
                     while (true) {
                         const {done, value} = await reader.read();
@@ -347,7 +498,6 @@ async def home() -> HTMLResponse:
                         buffer = parts.pop();
 
                         for (const part of parts) {
-                            // Parse each SSE event: look for "event:" and "data:" lines
                             let eventType = "message";
                             let eventData = "";
 
@@ -359,28 +509,45 @@ async def home() -> HTMLResponse:
                                 }
                             }
 
-                            // Handle classification event — show the routing badge
+                            // Classification event — show routing badge
                             if (eventType === "classification") {
                                 const info = JSON.parse(eventData);
-                                currentModel = info.model;
                                 routingBadge.innerHTML =
                                     'Routed to: <span class="model-name">' + info.model + '</span>' +
                                     '<span class="route-reason"> (' + info.reason + ')</span>';
                                 routingBadge.style.display = "block";
-                                statusDiv.textContent = "Streaming response...";
+                                if (info.model_loaded) {
+                                    statusDiv.textContent = "Streaming response...";
+                                } else {
+                                    statusDiv.textContent = "Loading " + info.model + " into memory (this may take a minute)...";
+                                }
                                 continue;
                             }
 
-                            // Handle token events
+                            // Metrics event — show timing info
+                            if (eventType === "metrics") {
+                                const m = JSON.parse(eventData);
+                                timingDiv.textContent =
+                                    "Classified in " + m.classify_seconds + "s" +
+                                    " | First token: " + m.first_token_seconds + "s" +
+                                    " | Total: " + m.total_seconds + "s" +
+                                    " | " + m.tokens_per_second + " tok/s" +
+                                    " (" + m.eval_count + " tokens)";
+                                timingDiv.style.display = "block";
+                                continue;
+                            }
+
+                            // [DONE] — finish up and refresh loaded models
                             if (eventData === "[DONE]") {
                                 statusDiv.textContent = "";
                                 sendBtn.disabled = false;
                                 questionInput.focus();
+                                refreshModels();
                                 return;
                             }
 
+                            // Token event — append to response
                             if (eventData) {
-                                // First token: show the response area
                                 if (responseDiv.style.display === "none") {
                                     statusDiv.textContent = "";
                                     responseDiv.style.display = "block";
@@ -396,6 +563,31 @@ async def home() -> HTMLResponse:
                 sendBtn.disabled = false;
                 questionInput.focus();
             }
+
+            // Fetch which models are currently loaded in Ollama's memory
+            async function refreshModels() {
+                try {
+                    const res = await fetch("/models");
+                    if (!res.ok) return;
+                    const data = await res.json();
+
+                    let html = '<span class="label">Models in memory:</span> ';
+                    if (data.loaded.length === 0) {
+                        html += '<span class="none-loaded">none</span>';
+                    } else {
+                        html += data.loaded.map(
+                            name => '<span class="model-tag">' + name + '</span>'
+                        ).join("");
+                    }
+                    loadedModelsDiv.innerHTML = html;
+                } catch (e) {
+                    loadedModelsDiv.innerHTML =
+                        '<span class="label">Models in memory:</span> <span class="none-loaded">could not reach Ollama</span>';
+                }
+            }
+
+            // Load model status on page load
+            refreshModels();
 
             // Auto-focus the input on page load
             questionInput.focus();
