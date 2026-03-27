@@ -248,6 +248,32 @@
             errorBanner.style.display = "none";
         }
 
+        // --- Minimal markdown rendering ---
+        // Handles fenced code blocks and inline code so the existing CSS
+        // for <pre><code> and <code> actually gets used. Everything else
+        // is escaped to prevent XSS — we never insert raw HTML from the model.
+        function renderMarkdown(text) {
+            // Escape HTML entities first so model output can't inject tags
+            const esc = text
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;");
+
+            // Fenced code blocks: ```lang\n...\n```
+            const withBlocks = esc.replace(
+                /```(\w*)\n([\s\S]*?)```/g,
+                (_, lang, code) => '<pre><code>' + code + '</code></pre>'
+            );
+
+            // Inline code: `...`
+            const withInline = withBlocks.replace(
+                /`([^`]+)`/g,
+                '<code>$1</code>'
+            );
+
+            return withInline;
+        }
+
         // --- Send a message ---
         async function send() {
             const text = inputEl.value.trim();
@@ -345,9 +371,16 @@
 
                         if (eventType === "classification") {
                             const info = JSON.parse(eventData);
-                            badgeDiv.innerHTML =
-                                '<span class="model">' + info.model + '</span>' +
-                                ' <span class="reason">' + info.reason + '</span>';
+                            // Use textContent (not innerHTML) to prevent XSS
+                            // from model names or classifier output
+                            const modelSpan = document.createElement("span");
+                            modelSpan.className = "model";
+                            modelSpan.textContent = info.model;
+                            const reasonSpan = document.createElement("span");
+                            reasonSpan.className = "reason";
+                            reasonSpan.textContent = " " + info.reason;
+                            badgeDiv.appendChild(modelSpan);
+                            badgeDiv.appendChild(reasonSpan);
 
                             // Replace status with assistant container
                             statusDiv.remove();
@@ -396,7 +429,7 @@
                             if (ls) ls.remove();
 
                             fullResponse += eventData;
-                            contentDiv.textContent = fullResponse;
+                            contentDiv.innerHTML = renderMarkdown(fullResponse);
                             scrollToBottom();
                         }
                     }
@@ -437,8 +470,14 @@
                 if (data.loaded.length === 0) {
                     loadedModelsEl.innerHTML = 'Models: <span style="color:#64748b">none loaded</span>';
                 } else {
-                    loadedModelsEl.innerHTML = "In memory: " +
-                        data.loaded.map(n => '<span class="tag">' + n + '</span>').join("");
+                    loadedModelsEl.textContent = "";
+                    loadedModelsEl.appendChild(document.createTextNode("In memory: "));
+                    for (const name of data.loaded) {
+                        const tag = document.createElement("span");
+                        tag.className = "tag";
+                        tag.textContent = name;
+                        loadedModelsEl.appendChild(tag);
+                    }
                 }
             } catch (e) {
                 loadedModelsEl.innerHTML = 'Models: <span style="color:#ef4444">offline</span>';

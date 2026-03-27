@@ -9,12 +9,13 @@ import json
 import logging
 import time
 from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from sse_starlette.sse import EventSourceResponse
 
 # Configure the classifier debug logger. Uvicorn's default log config
@@ -26,9 +27,31 @@ if not logger.handlers:
     _handler.setFormatter(logging.Formatter("%(name)s: %(message)s"))
     logger.addHandler(_handler)
 
-app = FastAPI()
-
 OLLAMA_BASE_URL = "http://localhost:11434"
+
+
+# --- Shared HTTP client (connection pooling) ---
+#
+# Without this, every call to check_ollama(), classify_question(), and
+# stream_chat() creates a brand-new httpx.AsyncClient — which means a
+# fresh TCP connection each time. That adds ~5-20ms of connection setup
+# per request. A shared client keeps connections alive and reuses them,
+# which matters when we make 2-3 Ollama calls per user message.
+#
+# FastAPI's "lifespan" is the standard way to manage resources that live
+# for the entire app lifetime: create on startup, clean up on shutdown.
+http_client: httpx.AsyncClient
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global http_client
+    http_client = httpx.AsyncClient(base_url=OLLAMA_BASE_URL)
+    yield
+    await http_client.aclose()
+
+
+app = FastAPI(lifespan=lifespan)
 
 # --- Why a tiny classifier model? ---
 #
@@ -109,6 +132,13 @@ Programming task"""
 class ChatRequest(BaseModel):
     messages: list[dict[str, str]]
 
+    @field_validator("messages")
+    @classmethod
+    def messages_not_empty(cls, v: list[dict[str, str]]) -> list[dict[str, str]]:
+        if not v:
+            raise ValueError("messages must contain at least one message")
+        return v
+
 
 # --- Ollama timing metadata ---
 # The final streaming chunk includes:
@@ -141,11 +171,10 @@ class ChatRequest(BaseModel):
 async def check_ollama() -> tuple[bool, list[str]]:
     """Check if Ollama is reachable and return (ok, list_of_loaded_models)."""
     try:
-        async with httpx.AsyncClient() as client:
-            ps_resp = await client.get(f"{OLLAMA_BASE_URL}/api/ps", timeout=5.0)
-            ps_resp.raise_for_status()
-            loaded = [m["name"] for m in ps_resp.json().get("models", [])]
-            return True, loaded
+        ps_resp = await http_client.get("/api/ps", timeout=5.0)
+        ps_resp.raise_for_status()
+        loaded = [m["name"] for m in ps_resp.json().get("models", [])]
+        return True, loaded
     except (httpx.ConnectError, httpx.HTTPError):
         return False, []
 
@@ -159,27 +188,26 @@ async def classify_question(question: str) -> tuple[str, str, str, float]:
     """
     start = time.monotonic()
 
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            f"{OLLAMA_BASE_URL}/api/chat",
-            json={
-                "model": CLASSIFIER_MODEL,
-                # We wrap the question in "Classify: ..." instead of sending
-                # it as a bare user message. Without this, small models see
-                # "Write a Python function..." and answer it instead of
-                # classifying it — the instruction-tuning is too strong.
-                "messages": [
-                    {"role": "system", "content": CLASSIFIER_SYSTEM_PROMPT},
-                    {"role": "user", "content": f"Classify: {question}"},
-                ],
-                "stream": False,
-                "think": False,
-                "options": {"temperature": 0, "num_ctx": 1024},
-            },
-            timeout=60.0,
-        )
-        response.raise_for_status()
-        data = response.json()
+    response = await http_client.post(
+        "/api/chat",
+        json={
+            "model": CLASSIFIER_MODEL,
+            # We wrap the question in "Classify: ..." instead of sending
+            # it as a bare user message. Without this, small models see
+            # "Write a Python function..." and answer it instead of
+            # classifying it — the instruction-tuning is too strong.
+            "messages": [
+                {"role": "system", "content": CLASSIFIER_SYSTEM_PROMPT},
+                {"role": "user", "content": f"Classify: {question}"},
+            ],
+            "stream": False,
+            "think": False,
+            "options": {"temperature": 0, "num_ctx": 1024},
+        },
+        timeout=60.0,
+    )
+    response.raise_for_status()
+    data = response.json()
 
     classify_time = time.monotonic() - start
     content = data["message"]["content"].strip()
@@ -254,8 +282,9 @@ async def stream_chat(
             ),
         }
         return
-    except Exception:
+    except Exception as e:
         # Classification failed but we can still answer with the default model
+        logger.warning("classify error: %s", e)
         route, reason = "general", "Classification failed, using default"
         model = ROUTE_TO_MODEL["general"]
         classify_time = 0.0
@@ -283,63 +312,60 @@ async def stream_chat(
     first_token_time: float | None = None
 
     try:
-        async with httpx.AsyncClient() as client:
-            # Disable thinking for non-reasoning routes (see comment above)
-            chat_payload: dict = {
-                "model": model,
-                "messages": messages,
-                "stream": True,
-                "options": {"num_ctx": 4096},
-            }
-            if route != "reasoning":
-                chat_payload["think"] = False
+        # Disable thinking for non-reasoning routes (see comment above)
+        chat_payload: dict = {
+            "model": model,
+            "messages": messages,
+            "stream": True,
+            "options": {"num_ctx": 4096},
+        }
+        if route != "reasoning":
+            chat_payload["think"] = False
 
-            async with client.stream(
-                "POST",
-                f"{OLLAMA_BASE_URL}/api/chat",
-                json=chat_payload,
-                timeout=stream_timeout,
-            ) as response:
-                response.raise_for_status()
+        async with http_client.stream(
+            "POST",
+            "/api/chat",
+            json=chat_payload,
+            timeout=stream_timeout,
+        ) as response:
+            response.raise_for_status()
 
-                async for line in response.aiter_lines():
-                    if not line:
-                        continue
+            async for line in response.aiter_lines():
+                if not line:
+                    continue
 
-                    chunk = json.loads(line)
-                    token = chunk["message"]["content"]
+                chunk = json.loads(line)
+                token = chunk["message"]["content"]
 
-                    if token:
-                        if first_token_time is None:
-                            first_token_time = time.monotonic() - stream_start
-                        yield {"data": token}
+                if token:
+                    if first_token_time is None:
+                        first_token_time = time.monotonic() - stream_start
+                    yield {"data": token}
 
-                    if chunk.get("done"):
-                        total_time = time.monotonic() - stream_start
-                        eval_count = chunk.get("eval_count", 0)
-                        eval_duration_ns = chunk.get("eval_duration", 0)
-                        tps = (
-                            eval_count / (eval_duration_ns / 1e9)
-                            if eval_duration_ns > 0
-                            else 0.0
-                        )
+                if chunk.get("done"):
+                    total_time = time.monotonic() - stream_start
+                    eval_count = chunk.get("eval_count", 0)
+                    eval_duration_ns = chunk.get("eval_duration", 0)
+                    tps = (
+                        eval_count / (eval_duration_ns / 1e9)
+                        if eval_duration_ns > 0
+                        else 0.0
+                    )
 
-                        yield {
-                            "event": "metrics",
-                            "data": json.dumps(
-                                {
-                                    "classify_seconds": round(classify_time, 2),
-                                    "first_token_seconds": round(
-                                        first_token_time or 0, 2
-                                    ),
-                                    "total_seconds": round(total_time, 2),
-                                    "tokens_per_second": round(tps, 1),
-                                    "eval_count": eval_count,
-                                }
-                            ),
-                        }
-                        yield {"data": "[DONE]"}
-                        return
+                    yield {
+                        "event": "metrics",
+                        "data": json.dumps(
+                            {
+                                "classify_seconds": round(classify_time, 2),
+                                "first_token_seconds": round(first_token_time or 0, 2),
+                                "total_seconds": round(total_time, 2),
+                                "tokens_per_second": round(tps, 1),
+                                "eval_count": eval_count,
+                            }
+                        ),
+                    }
+                    yield {"data": "[DONE]"}
+                    return
 
     except httpx.ConnectError:
         yield {
@@ -372,22 +398,21 @@ async def clear() -> dict[str, str]:
 async def models() -> dict:
     """List available and loaded models from Ollama."""
     try:
-        async with httpx.AsyncClient() as client:
-            tags_resp = await client.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=10.0)
-            tags_resp.raise_for_status()
-            all_models = [
-                {
-                    "name": m["name"],
-                    "size_gb": round(m["size"] / 1e9, 1),
-                    "parameter_size": m["details"].get("parameter_size", ""),
-                    "quantization": m["details"].get("quantization_level", ""),
-                }
-                for m in tags_resp.json().get("models", [])
-            ]
+        tags_resp = await http_client.get("/api/tags", timeout=10.0)
+        tags_resp.raise_for_status()
+        all_models = [
+            {
+                "name": m["name"],
+                "size_gb": round(m["size"] / 1e9, 1),
+                "parameter_size": m["details"].get("parameter_size", ""),
+                "quantization": m["details"].get("quantization_level", ""),
+            }
+            for m in tags_resp.json().get("models", [])
+        ]
 
-            ps_resp = await client.get(f"{OLLAMA_BASE_URL}/api/ps", timeout=10.0)
-            ps_resp.raise_for_status()
-            loaded = [m["name"] for m in ps_resp.json().get("models", [])]
+        ps_resp = await http_client.get("/api/ps", timeout=10.0)
+        ps_resp.raise_for_status()
+        loaded = [m["name"] for m in ps_resp.json().get("models", [])]
 
         return {"available": all_models, "loaded": loaded}
     except (httpx.ConnectError, httpx.HTTPError):
